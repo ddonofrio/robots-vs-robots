@@ -1,0 +1,113 @@
+import { terrainFloorY, terrainKindAt, terrainSurfaceY } from './procedural-terrain';
+import { key, unkey, type Block, type ProceduralTerrain, type Vec3, type Material } from './types';
+
+export interface ProceduralFluid { kind:string;level:number;bounds:{min:Vec3;max:Vec3} }
+
+export class Voxels {
+  readonly cells = new Map<string, string>();
+  readonly removed = new Set<string>();
+  readonly chunks = new Map<string, Set<string>>();
+  changes = new Map<string, string | null>();
+  constructor(
+    readonly materials: Record<string, Material>,
+    blocks: Block[] = [],
+    readonly fluid?: ProceduralFluid,
+    readonly terrain?: ProceduralTerrain,
+    removed: string[] = [],
+    readonly terrainSeed=0,
+  ) {
+    for (const [x, y, z, kind] of blocks) this.set([x, y, z], kind);
+    for (const voxel of removed) this.removed.add(voxel);
+    this.changes.clear();
+  }
+  chunk(p: Vec3) { return p.map(v => Math.floor(v / 16)).join(','); }
+  private fluidAt(p:Vec3) {
+    if(!this.fluid)return undefined;
+    const point=p.map(Math.floor) as Vec3;
+    return point.every((value,index)=>value>=this.fluid!.bounds.min[index]&&value<this.fluid!.bounds.max[index])&&point[1]<this.fluid.level?this.fluid.kind:undefined;
+  }
+  private terrainAt(p: Vec3) {
+    return terrainKindAt(this.terrain,this.terrainSeed,p);
+  }
+  get(p: Vec3) {
+    const point=p.map(Math.floor) as Vec3,k=key(point),explicit=this.cells.get(k);
+    if(explicit)return explicit;
+    if(this.removed.has(k))return undefined;
+    return this.terrainAt(point)??this.fluidAt(point);
+  }
+  solid(p: Vec3) { const kind = this.get(p); return !!kind && this.materials[kind]?.solid; }
+  set(p: Vec3, kind: string | null) {
+    const k = key(p), c = this.chunk(p);
+    if (kind) {
+      this.cells.set(k, kind);
+      this.removed.delete(k);
+      if (!this.chunks.has(c)) this.chunks.set(c, new Set());
+      this.chunks.get(c)!.add(k);
+    } else {
+      this.cells.delete(k); this.chunks.get(c)?.delete(k);
+      if (!this.chunks.get(c)?.size) this.chunks.delete(c);
+      if(this.terrainAt(p))this.removed.add(k);else this.removed.delete(k);
+    }
+    this.changes.set(k, kind);
+  }
+  nearby(center: Vec3, radius: number): Block[] {
+    const blocks: Block[] = [];
+    const min = center.map(v => Math.floor((v - radius) / 16));
+    const max = center.map(v => Math.floor((v + radius) / 16));
+    for (let x = min[0]; x <= max[0]; x++) for (let y = min[1]; y <= max[1]; y++) for (let z = min[2]; z <= max[2]; z++) {
+      for (const k of this.chunks.get(`${x},${y},${z}`) ?? []) {
+        const p = unkey(k);
+        if (Math.hypot(p[0] + .5 - center[0], p[1] + .5 - center[1], p[2] + .5 - center[2]) <= radius) blocks.push([...p, this.cells.get(k)!]);
+      }
+    }
+    if(this.fluid){
+      const y=Math.ceil(this.fluid.level)-1;
+      for(let x=Math.max(this.fluid.bounds.min[0],Math.floor(center[0]-radius));x<Math.min(this.fluid.bounds.max[0],Math.ceil(center[0]+radius));x++){
+        for(let z=Math.max(this.fluid.bounds.min[2],Math.floor(center[2]-radius));z<Math.min(this.fluid.bounds.max[2],Math.ceil(center[2]+radius));z++){
+          const point:Vec3=[x,y,z];
+          if(!this.cells.has(key(point))&&!this.solid([x,y+1,z])&&Math.hypot(x+.5-center[0],y+.5-center[1],z+.5-center[2])<=radius)blocks.push([x,y,z,this.fluid.kind]);
+        }
+      }
+    }
+    if(this.terrain?.type==='layers'){
+      const top=this.terrain.top,minX=Math.floor(center[0]-radius),maxX=Math.ceil(center[0]+radius),minZ=Math.floor(center[2]-radius),maxZ=Math.ceil(center[2]+radius);
+      for(let x=minX;x<maxX;x++)for(let z=minZ;z<maxZ;z++){
+        let y=top;
+        while(y>=this.terrain.layers.at(-1)!.min&&!this.get([x,y,z]))y--;
+        const kind=y>=this.terrain.layers.at(-1)!.min?this.get([x,y,z]):undefined;
+        const point:Vec3=[x,y,z],k=key(point);
+        if(kind&&!this.cells.has(k)&&Math.hypot(x+.5-center[0],y+.5-center[1],z+.5-center[2])<=radius)blocks.push([x,y,z,kind]);
+      }
+    }else if(this.terrain){
+      const floor=terrainFloorY(this.terrain),minX=Math.floor(center[0]-radius),maxX=Math.ceil(center[0]+radius),minZ=Math.floor(center[2]-radius),maxZ=Math.ceil(center[2]+radius),neighbors:Vec3[]=[[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+      for(let x=minX;x<maxX;x++)for(let z=minZ;z<maxZ;z++){
+        const top=terrainSurfaceY(this.terrain,this.terrainSeed,x,z),minY=Math.max(floor,Math.floor(center[1]-radius)),maxY=Math.min(top,Math.ceil(center[1]+radius));
+        for(let y=maxY;y>=minY;y--){
+          const point:Vec3=[x,y,z],k=key(point),kind=this.terrainAt(point);
+          if(!kind||this.cells.has(k)||this.removed.has(k)||Math.hypot(x+.5-center[0],y+.5-center[1],z+.5-center[2])>radius)continue;
+          if(neighbors.some(offset=>!this.solid(point.map((value,index)=>value+offset[index]) as Vec3)))blocks.push([x,y,z,kind]);
+        }
+      }
+    }
+    return blocks;
+  }
+  serialize(): Block[] { return [...this.cells].map(([k, kind]) => [...unkey(k), kind]); }
+  serializeRemoved(): string[] { return [...this.removed]; }
+  clearLine(a: Vec3, b: Vec3, ignoreEnd = false): boolean {
+    // Amanatides-Woo grid traversal: visit crossed voxels, not arbitrary ray samples.
+    const cell = a.map(Math.floor) as Vec3;
+    const delta = b.map((v,i) => v-a[i]);
+    const step = delta.map(Math.sign);
+    const stride = delta.map(v => v === 0 ? Infinity : Math.abs(1/v));
+    const next = delta.map((v,i) => v === 0 ? Infinity : (cell[i] + (v > 0 ? 1 : 0) - a[i]) / v);
+    const limit = Math.ceil(delta.reduce((sum,v) => sum+Math.abs(v),0))+3;
+    const endKey = key(b.map(Math.floor) as Vec3);
+    for (let i=0;i<limit;i++) {
+      const t = Math.min(...next); if (t >= 1-1e-9) break;
+      for (let axis=0;axis<3;axis++) if (next[axis] <= t+1e-9) { cell[axis] += step[axis]; next[axis] += stride[axis]; }
+      if (ignoreEnd && key(cell) === endKey) continue;
+      if (this.solid(cell)) return false;
+    }
+    return true;
+  }
+}
